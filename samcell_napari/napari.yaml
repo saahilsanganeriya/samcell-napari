@@ -1,0 +1,17 @@
+name: samcell-napari
+schema_version: 0.1.1
+contributions:
+  commands:
+    - id: samcell-napari.widget
+      title: Create SAMCell Segmentation Widget
+      python_name: samcell_napari:samcell_widget
+    - id: samcell-napari.data.sample_2d
+      title: Sample 2D Image
+      python_name: samcell_napari._sample_data:sample_2d
+  widgets:
+    - command: samcell-napari.widget
+      display_name: SAMCell Segmentation
+  sample_data:
+    - display_name: Sample Cell Image (2D)
+      key: sample_2d
+      command: samcell-napari.data.sample_2d 

@@ -1,0 +1,36 @@
+# SAMCell model files
+samcell_napari/models/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS specific
+.DS_Store
+.Trashes
+Thumbs.db
+ehthumbs.db

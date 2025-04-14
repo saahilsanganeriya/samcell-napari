@@ -1,0 +1,11 @@
+napari[all]>=0.4.14
+numpy
+torch>=1.9
+transformers>=4.26.0
+scikit-image
+opencv-python
+timm>=0.6.0
+safetensors>=0.3.0
+pyinstaller>=5.13.0
+wheel>=0.42.0
+setuptools>=68.0.0 

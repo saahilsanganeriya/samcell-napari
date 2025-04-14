@@ -1,0 +1,7 @@
+include LICENSE
+include README.md
+include requirements.txt
+recursive-include samcell_napari/sample_data *
+include samcell_napari/napari.yaml
+include samcell_napari/*.py
+include samcell_napari/icon.svg 
