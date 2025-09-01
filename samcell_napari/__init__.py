@@ -2,7 +2,7 @@
 SAMCell napari plugin for cell segmentation.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 from ._dock_widget import samcell_widget
 
