@@ -10,6 +10,7 @@ import numpy as np
 import logging
 import traceback
 import threading
+import cv2
 
 # Check for the required dependencies
 required_packages = {
@@ -57,6 +58,7 @@ except ImportError as e:
 try:
     from .model import SAMCellModel
     from .pipeline import SAMCellPipeline
+    from .metrics import calculate_all_metrics, export_metrics_csv, compute_gui_metrics
 except ImportError as e:
     error_message = f"Error importing SAMCell modules: {e}. This could be due to missing dependencies."
     print(error_message, file=sys.stderr)
@@ -107,7 +109,7 @@ progress_widget = None
 
 # Worker function for asynchronous processing
 @thread_worker
-def run_segmentation(image, model_path, threshold_max, threshold_fill, crop_size, output_distance):
+def run_segmentation(image, model_path, threshold_max, threshold_fill, crop_size, output_distance, process_all_frames, export_metrics, include_texture):
     global model, pipeline
     
     try:
@@ -120,26 +122,101 @@ def run_segmentation(image, model_path, threshold_max, threshold_fill, crop_size
         # Make a copy to avoid modifying original
         image = image.copy()
         
-        # Check if image is 2D
-        if image.ndim > 2:
-            # Handle RGB or multi-channel images
-            if image.ndim == 3 and image.shape[2] in [3, 4]:  # RGB/RGBA
-                # Use a safer method to convert to grayscale
-                if image.dtype != np.uint8:
-                    image = (image * 255).astype(np.uint8)
-                image = np.mean(image[:, :, :3], axis=2).astype(np.uint8)
-                logger.info(f"Converted RGB image to grayscale, shape: {image.shape}")
+        # Handle multiple frames/images if requested
+        original_shape = image.shape
+        images_to_process = []
+        
+        if process_all_frames and image.ndim > 2:
+            if image.ndim == 3 and image.shape[0] > 1:
+                # Time series or z-stack (T, H, W) or (Z, H, W)
+                logger.info(f"Processing {image.shape[0]} frames from time series/z-stack")
+                for i in range(image.shape[0]):
+                    images_to_process.append(image[i])
+            elif image.ndim == 4 and image.shape[0] > 1:
+                # 4D data (T, H, W, C) - extract frames
+                logger.info(f"Processing {image.shape[0]} frames from 4D data")
+                for i in range(image.shape[0]):
+                    images_to_process.append(image[i])
             else:
-                raise ValueError("Only 2D images are supported. For multi-channel images, please select a single channel.")
+                # Single image - add to list
+                images_to_process.append(image)
+        else:
+            # Single image processing
+            images_to_process.append(image)
+        
+        def preprocess_single_image(img):
+            """Preprocess a single image to 2D grayscale uint8"""
+            # Handle different image formats and dimensions
+            if img.ndim > 2:
+                # Handle multi-dimensional images
+                if img.ndim == 3:
+                    if img.shape[2] in [3, 4]:  # RGB/RGBA
+                        # Convert RGB/RGBA to grayscale using standard weights
+                        if img.dtype != np.uint8:
+                            # Normalize to 0-255 range first if needed
+                            if np.max(img) <= 1.0:
+                                img = (img * 255).astype(np.uint8)
+                            else:
+                                img = img.astype(np.uint8)
+                        # Use OpenCV's standard RGB to grayscale conversion
+                        img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+                        logger.info(f"Converted RGB image to grayscale, shape: {img.shape}")
+                    elif img.shape[2] == 1:  # Single channel in 3D format
+                        img = img[:, :, 0]
+                        logger.info(f"Extracted single channel from 3D image, shape: {img.shape}")
+                    else:
+                        # For multi-channel microscopy images, take the first channel
+                        logger.warning(f"Multi-channel image with {img.shape[2]} channels detected. Using first channel.")
+                        img = img[:, :, 0]
+                elif img.ndim == 4:
+                    # Handle 4D images (e.g., time series, z-stacks)
+                    if img.shape[0] == 1:
+                        # Single frame/slice
+                        img = img[0]
+                        if img.ndim == 3 and img.shape[2] == 1:
+                            img = img[:, :, 0]
+                        logger.info(f"Extracted single frame from 4D image, shape: {img.shape}")
+                    else:
+                        raise ValueError(f"4D images with multiple frames/slices are not supported. Please select a single frame. Shape: {img.shape}")
+                else:
+                    raise ValueError(f"Images with {img.ndim} dimensions are not supported. Only 2D grayscale images are supported.")
+            
+            # Ensure we have a 2D grayscale image at this point
+            if img.ndim != 2:
+                raise ValueError(f"After preprocessing, image should be 2D but got shape: {img.shape}")
                 
-        # Make sure image is the right type
-        if image.dtype != np.uint8:
-            logger.info(f"Converting image from {image.dtype} to uint8")
-            if np.max(image) > 1.0 and np.max(image) <= 255:
-                image = image.astype(np.uint8)
-            else:
-                # Normalize to 0-255 range
-                image = ((image - np.min(image)) / (np.max(image) - np.min(image)) * 255).astype(np.uint8)
+            # Handle different data types and normalize to uint8
+            if img.dtype != np.uint8:
+                logger.info(f"Converting image from {img.dtype} to uint8")
+                if img.dtype in [np.float32, np.float64]:
+                    if np.max(img) <= 1.0:
+                        # Float image in [0, 1] range
+                        img = (img * 255).astype(np.uint8)
+                    else:
+                        # Float image in [0, 255] or other range
+                        img = np.clip(img, 0, 255).astype(np.uint8)
+                elif img.dtype in [np.int16, np.uint16]:
+                    # 16-bit images - normalize to 8-bit
+                    img = ((img - np.min(img)) / (np.max(img) - np.min(img)) * 255).astype(np.uint8)
+                else:
+                    # Other integer types
+                    if np.max(img) <= 255:
+                        img = img.astype(np.uint8)
+                    else:
+                        # Normalize to 0-255 range
+                        img = ((img - np.min(img)) / (np.max(img) - np.min(img)) * 255).astype(np.uint8)
+            return img
+        
+        # Preprocess all images
+        processed_images = []
+        for i, img in enumerate(images_to_process):
+            try:
+                processed_img = preprocess_single_image(img)
+                processed_images.append(processed_img)
+                logger.info(f"Preprocessed image {i+1}/{len(images_to_process)}, shape: {processed_img.shape}")
+            except Exception as e:
+                logger.error(f"Error preprocessing image {i+1}: {str(e)}")
+                raise
         
         # Check model path
         if not model_path or not os.path.exists(model_path):
@@ -238,83 +315,138 @@ def run_segmentation(image, model_path, threshold_max, threshold_fill, crop_size
             # Initial progress update
             yield {"progress": progress_data["percent"], "status": progress_data["status"]}
             
-            # Process the image - this will update progress through the callback
-            # Start processing in main thread - the pipeline will update our progress_data through the callback
-            dist_map_result = [None]  # Use a list to store the result
+            # Process all images
+            all_labels = []
+            all_dist_maps = []
+            total_cells = 0
             
-            def process_image():
-                # Process the image and store the result
-                result = pipeline.pipeline.predict_on_full_img(image)
-                dist_map_result[0] = result
+            for img_idx, img in enumerate(processed_images):
+                img_progress_start = 15 + (img_idx / len(processed_images)) * 70
+                img_progress_end = 15 + ((img_idx + 1) / len(processed_images)) * 70
                 
-            # Start processing in a separate thread
-            dist_map_thread = threading.Thread(target=process_image)
-            dist_map_thread.daemon = True
-            dist_map_thread.start()
-            
-            # Poll for progress updates during processing
-            last_percent = 0
-            while dist_map_thread.is_alive():
-                if progress_data["percent"] != last_percent:
-                    # Only yield if progress has changed
-                    last_percent = progress_data["percent"]
-                    yield {"progress": progress_data["percent"], "status": progress_data["status"]}
-                # Short sleep to prevent UI freeze
-                time.sleep(0.1)
-            
-            # Wait for thread to complete
-            dist_map_thread.join()
-            
-            # Get the result
-            dist_map = dist_map_result[0]
-            
-            # Now that processing is complete, execute the watershed step
-            # Extract cells from distance map - this will update progress to ~95%
-            labels_result = [None]  # Use a list to store the result
-            
-            def process_labels():
-                # Process the labels and store the result
-                result = pipeline.pipeline.cells_from_dist_map(dist_map)
-                labels_result[0] = result
+                logger.info(f"Processing image {img_idx + 1}/{len(processed_images)}")
+                yield {"progress": img_progress_start, "status": f"Processing image {img_idx + 1}/{len(processed_images)}"}
                 
-            # Start processing in a separate thread
-            labels_thread = threading.Thread(target=process_labels)
-            labels_thread.daemon = True
-            labels_thread.start()
+                # Process the image - this will update progress through the callback
+                # Start processing in main thread - the pipeline will update our progress_data through the callback
+                dist_map_result = [None]  # Use a list to store the result
+                
+                def process_image():
+                    # Process the image and store the result
+                    result = pipeline.pipeline.predict_on_full_img(img)
+                    dist_map_result[0] = result
+                    
+                # Start processing in a separate thread
+                dist_map_thread = threading.Thread(target=process_image)
+                dist_map_thread.daemon = True
+                dist_map_thread.start()
+                
+                # Poll for progress updates during processing
+                last_percent = img_progress_start
+                while dist_map_thread.is_alive():
+                    current_progress = max(img_progress_start, min(progress_data["percent"], img_progress_end - 10))
+                    if current_progress != last_percent:
+                        # Only yield if progress has changed
+                        last_percent = current_progress
+                        yield {"progress": current_progress, "status": f"Processing image {img_idx + 1}/{len(processed_images)} - {progress_data['status']}"}
+                    # Short sleep to prevent UI freeze
+                    time.sleep(0.1)
+                
+                # Wait for thread to complete
+                dist_map_thread.join()
+                
+                # Get the result
+                dist_map = dist_map_result[0]
+                
+                # Now that processing is complete, execute the watershed step
+                # Extract cells from distance map
+                labels_result = [None]  # Use a list to store the result
+                
+                def process_labels():
+                    # Process the labels and store the result
+                    result = pipeline.pipeline.cells_from_dist_map(dist_map)
+                    labels_result[0] = result
+                    
+                # Start processing in a separate thread
+                labels_thread = threading.Thread(target=process_labels)
+                labels_thread.daemon = True
+                labels_thread.start()
+                
+                # Poll for progress updates during processing
+                while labels_thread.is_alive():
+                    current_progress = max(last_percent, min(progress_data["percent"], img_progress_end))
+                    if current_progress != last_percent:
+                        last_percent = current_progress
+                        yield {"progress": current_progress, "status": f"Processing image {img_idx + 1}/{len(processed_images)} - {progress_data['status']}"}
+                    time.sleep(0.1)
+                
+                # Wait for thread to complete
+                labels_thread.join()
+                
+                # Get the result
+                labels = labels_result[0]
+                
+                # Store results
+                all_labels.append(labels)
+                all_dist_maps.append(dist_map)
+                
+                # Count cells in this image
+                img_cells = len(np.unique(labels)) - 1  # -1 to exclude background
+                total_cells += img_cells
+                logger.info(f"Image {img_idx + 1} complete. Found {img_cells} cells.")
+                
+                yield {"progress": img_progress_end, "status": f"Image {img_idx + 1}/{len(processed_images)} complete: {img_cells} cells"}
             
-            # Poll for progress updates during processing
-            last_percent = 0
-            while labels_thread.is_alive():
-                if progress_data["percent"] != last_percent:
-                    # Only yield if progress has changed
-                    last_percent = progress_data["percent"]
-                    yield {"progress": progress_data["percent"], "status": progress_data["status"]}
-                # Short sleep to prevent UI freeze
-                time.sleep(0.1)
-            
-            # Wait for thread to complete
-            labels_thread.join()
-            
-            # Get the result
-            labels = labels_result[0]
-            
-            # Progress update - should be around 95% now
-            yield {"progress": progress_data["percent"], "status": progress_data["status"]}
-            
-            # Log results
-            num_cells = len(np.unique(labels)) - 1  # -1 to exclude background
-            logger.info(f"Segmentation complete. Found {num_cells} cells.")
+            # Combine results for output
+            if len(all_labels) == 1:
+                # Single image
+                final_labels = all_labels[0]
+                final_dist_map = all_dist_maps[0] if output_distance else None
+            else:
+                # Multiple images - stack them
+                final_labels = np.stack(all_labels, axis=0)
+                final_dist_map = np.stack(all_dist_maps, axis=0) if output_distance else None
             
             # Ensure outputs are numpy arrays and contiguous
-            labels = np.ascontiguousarray(labels)
-            dist_map = np.ascontiguousarray(dist_map)
+            final_labels = np.ascontiguousarray(final_labels)
+            if final_dist_map is not None:
+                final_dist_map = np.ascontiguousarray(final_dist_map)
+            
+            # Calculate and export metrics if requested
+            metrics_data = None
+            if export_metrics:
+                yield {"progress": 95, "status": "Calculating comprehensive metrics..."}
+                try:
+                    # For multiple images, calculate metrics for each image separately
+                    if len(processed_images) > 1:
+                        all_metrics = []
+                        for i, (labels_img, orig_img) in enumerate(zip(all_labels, processed_images)):
+                            logger.info(f"Calculating metrics for image {i+1}/{len(processed_images)}")
+                            img_metrics = calculate_all_metrics(labels_img, orig_img, include_texture)
+                            if not img_metrics.empty:
+                                img_metrics['image_id'] = i + 1
+                                all_metrics.append(img_metrics)
+                        
+                        if all_metrics:
+                            import pandas as pd
+                            metrics_data = pd.concat(all_metrics, ignore_index=True)
+                    else:
+                        # Single image
+                        original_for_metrics = processed_images[0] if processed_images else None
+                        metrics_data = calculate_all_metrics(final_labels, original_for_metrics, include_texture)
+                    
+                    logger.info(f"Calculated metrics: {len(metrics_data) if metrics_data is not None and not metrics_data.empty else 0} cells")
+                    
+                except Exception as e:
+                    logger.error(f"Error calculating metrics: {str(e)}")
+                    metrics_data = None
             
             # Final progress update with the result data included
             # For generator workers, the last yielded value is used as the result
             yield {
                 "progress": 100, 
-                "status": f"Complete! Found {num_cells} cells.",
-                "result": (labels, dist_map, num_cells)
+                "status": f"Complete! Processed {len(processed_images)} image(s), found {total_cells} total cells.",
+                "result": (final_labels, final_dist_map, total_cells, len(processed_images), metrics_data)
             }
             
             # No return needed - the last yield contains the result
@@ -323,24 +455,28 @@ def run_segmentation(image, model_path, threshold_max, threshold_fill, crop_size
             logger.error(f"Segmentation error: {str(e)}")
             logger.error(traceback.format_exc())
             # Create empty results instead of raising to avoid callback issues
-            empty_labels = np.zeros(image.shape[:2], dtype=np.int32)
-            empty_dist_map = np.zeros(image.shape[:2], dtype=np.float32)
+            if processed_images:
+                empty_labels = np.zeros(processed_images[0].shape, dtype=np.int32)
+                empty_dist_map = np.zeros(processed_images[0].shape, dtype=np.float32)
+            else:
+                empty_labels = np.zeros((256, 256), dtype=np.int32)
+                empty_dist_map = np.zeros((256, 256), dtype=np.float32)
             yield {
                 "progress": 100, 
                 "status": f"Error: {str(e)}",
-                "result": (empty_labels, empty_dist_map, 0)
+                "result": (empty_labels, empty_dist_map, 0, 1, None)
             }
         
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}")
         logger.error(traceback.format_exc())
         # Return empty results to avoid callback issues
-        empty_labels = np.zeros(image.shape[:2], dtype=np.int32)
-        empty_dist_map = np.zeros(image.shape[:2], dtype=np.float32)
+        empty_labels = np.zeros((256, 256), dtype=np.int32)
+        empty_dist_map = np.zeros((256, 256), dtype=np.float32)
         yield {
             "progress": 100, 
             "status": f"Error: {str(e)}",
-            "result": (empty_labels, empty_dist_map, 0)
+            "result": (empty_labels, empty_dist_map, 0, 1, None)
         }
 
 def check_dependencies():
@@ -397,6 +533,18 @@ def check_dependencies():
                      label="Output distance map",
                      value=True,
                      tooltip="Output the distance map as a separate layer"),
+    process_all_frames=dict(widget_type="CheckBox",
+                        label="Process all frames/images",
+                        value=False,
+                        tooltip="Process all frames in a time series or all images in a stack"),
+    export_metrics=dict(widget_type="CheckBox",
+                       label="Export metrics to CSV",
+                       value=False,
+                       tooltip="Calculate and export comprehensive cell metrics to CSV file"),
+    include_texture=dict(widget_type="CheckBox",
+                        label="Include texture metrics",
+                        value=False,
+                        tooltip="Include texture analysis (slower but more comprehensive)"),
 )
 def samcell_widget(
     viewer: Viewer,
@@ -406,6 +554,9 @@ def samcell_widget(
     threshold_fill: float = 0.09,
     crop_size: int = 256,
     output_distance: bool = True,
+    process_all_frames: bool = False,
+    export_metrics: bool = False,
+    include_texture: bool = False,
 ):
     """
     SAMCell segmentation widget
@@ -470,7 +621,10 @@ def samcell_widget(
         threshold_max, 
         threshold_fill, 
         crop_size, 
-        output_distance
+        output_distance,
+        process_all_frames,
+        export_metrics,
+        include_texture
     )
     
     # Create a dict to store the final result
@@ -521,9 +675,17 @@ def samcell_widget(
             return
             
         try:
-            # Get results - handle the tuple format (labels, dist_map, num_cells)
-            if isinstance(result, tuple) and len(result) == 3:
+            # Get results - handle the tuple format (labels, dist_map, num_cells, num_images, metrics_data)
+            if isinstance(result, tuple) and len(result) == 5:
+                labels, dist_map, num_cells, num_images, metrics_data = result
+            elif isinstance(result, tuple) and len(result) == 4:
+                labels, dist_map, num_cells, num_images = result
+                metrics_data = None
+            elif isinstance(result, tuple) and len(result) == 3:
+                # Backward compatibility
                 labels, dist_map, num_cells = result
+                num_images = 1
+                metrics_data = None
             else:
                 show_error(f"Unexpected result format: {type(result)}")
                 progress_widget.hide()
@@ -544,8 +706,49 @@ def samcell_widget(
                 else:
                     viewer.add_image(dist_map, name=dist_name, colormap='magma')
                     
+            # Export metrics if available
+            if metrics_data is not None and not metrics_data.empty:
+                try:
+                    # Generate filename based on image layer name
+                    import os
+                    from pathlib import Path
+                    
+                    # Get user's home directory or current working directory
+                    try:
+                        home_dir = Path.home()
+                        if home_dir.exists():
+                            base_dir = home_dir / "Desktop"  # Try Desktop first
+                            if not base_dir.exists():
+                                base_dir = home_dir
+                        else:
+                            base_dir = Path.cwd()
+                    except:
+                        base_dir = Path.cwd()
+                    
+                    # Create filename
+                    base_name = image_layer.name.replace(' ', '_').replace('/', '_')
+                    csv_filename = f"{base_name}_samcell_metrics.csv"
+                    csv_path = base_dir / csv_filename
+                    
+                    # Save metrics
+                    metrics_data.to_csv(csv_path, index=False)
+                    logger.info(f"Metrics exported to {csv_path}")
+                    show_info(f"Metrics exported to: {csv_path}")
+                    
+                except Exception as e:
+                    logger.error(f"Error exporting metrics: {str(e)}")
+                    show_warning(f"Could not export metrics: {str(e)}")
+            
             # Show success message
-            show_info(f"Segmentation complete. Found {num_cells} cells.")
+            if num_images > 1:
+                success_msg = f"Segmentation complete. Processed {num_images} images, found {num_cells} total cells."
+            else:
+                success_msg = f"Segmentation complete. Found {num_cells} cells."
+                
+            if metrics_data is not None and not metrics_data.empty:
+                success_msg += f" Metrics calculated for {len(metrics_data)} cells."
+                
+            show_info(success_msg)
         except Exception as e:
             logger.error(f"Error processing results: {str(e)}")
             logger.error(traceback.format_exc())
