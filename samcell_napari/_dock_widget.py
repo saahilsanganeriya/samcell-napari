@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 import importlib
 import numpy as np
+import pandas as pd
 import logging
 import traceback
 import threading
@@ -58,7 +59,7 @@ except ImportError as e:
 try:
     from .model import SAMCellModel
     from .pipeline import SAMCellPipeline
-    from .metrics import calculate_all_metrics, export_metrics_csv, compute_gui_metrics
+    from .metrics import calculate_all_metrics, export_metrics_csv, compute_gui_metrics, calculate_metric_statistics, export_metrics_excel
 except ImportError as e:
     error_message = f"Error importing SAMCell modules: {e}. This could be due to missing dependencies."
     print(error_message, file=sys.stderr)
@@ -109,7 +110,7 @@ progress_widget = None
 
 # Worker function for asynchronous processing
 @thread_worker
-def run_segmentation(image, model_path, threshold_max, threshold_fill, crop_size, output_distance, process_all_frames, export_metrics, include_texture):
+def run_segmentation(image, model_path, threshold_max, threshold_fill, crop_size, output_distance, process_all_frames, export_metrics, include_texture, export_format):
     global model, pipeline
     
     try:
@@ -538,13 +539,18 @@ def check_dependencies():
                         value=False,
                         tooltip="Process all frames in a time series or all images in a stack"),
     export_metrics=dict(widget_type="CheckBox",
-                       label="Export metrics to CSV",
+                       label="Export comprehensive metrics",
                        value=False,
-                       tooltip="Calculate and export comprehensive cell metrics to CSV file"),
+                       tooltip="Calculate and export comprehensive cell metrics with statistics"),
     include_texture=dict(widget_type="CheckBox",
                         label="Include texture metrics",
                         value=False,
                         tooltip="Include texture analysis (slower but more comprehensive)"),
+    export_format=dict(widget_type="ComboBox",
+                      label="Export format",
+                      choices=["Excel", "CSV", "Both"],
+                      value="Excel",
+                      tooltip="Format for metrics export (Excel provides separate sheets for better organization)"),
 )
 def samcell_widget(
     viewer: Viewer,
@@ -557,6 +563,7 @@ def samcell_widget(
     process_all_frames: bool = False,
     export_metrics: bool = False,
     include_texture: bool = False,
+    export_format: str = "Excel",
 ):
     """
     SAMCell segmentation widget
@@ -624,7 +631,8 @@ def samcell_widget(
         output_distance,
         process_all_frames,
         export_metrics,
-        include_texture
+        include_texture,
+        export_format
     )
     
     # Create a dict to store the final result
@@ -725,15 +733,93 @@ def samcell_widget(
                     except:
                         base_dir = Path.cwd()
                     
-                    # Create filename
+                    # Create base filename
                     base_name = image_layer.name.replace(' ', '_').replace('/', '_')
-                    csv_filename = f"{base_name}_samcell_metrics.csv"
-                    csv_path = base_dir / csv_filename
                     
-                    # Save metrics
-                    metrics_data.to_csv(csv_path, index=False)
-                    logger.info(f"Metrics exported to {csv_path}")
-                    show_info(f"Metrics exported to: {csv_path}")
+                    # Export based on selected format
+                    exported_files = []
+                    
+                    if export_format in ["CSV", "Both"]:
+                        # Export CSV with statistics
+                        csv_filename = f"{base_name}_samcell_metrics.csv"
+                        csv_path = base_dir / csv_filename
+                        
+                        # Calculate and include statistics
+                        stats_df = calculate_metric_statistics(metrics_data)
+                        
+                        # Create comprehensive CSV with sections
+                        sections = [metrics_data]
+                        
+                        if not stats_df.empty:
+                            separator = pd.DataFrame([{col: '---' for col in metrics_data.columns}])
+                            sections.append(separator)
+                            
+                            # Align statistics columns
+                            stats_aligned = pd.DataFrame()
+                            stats_aligned['metric'] = stats_df['metric']
+                            stats_aligned['statistic_type'] = 'STATISTICS'
+                            for stat_col in ['count', 'mean', 'median', 'std', 'min', 'max', 'range', 'q25', 'q75', 'iqr']:
+                                if stat_col in stats_df.columns:
+                                    stats_aligned[stat_col] = stats_df[stat_col]
+                            
+                            # Fill remaining columns
+                            for col in metrics_data.columns:
+                                if col not in stats_aligned.columns:
+                                    stats_aligned[col] = np.nan
+                            
+                            sections.append(stats_aligned)
+                        
+                        # Combine and save
+                        final_df = pd.concat(sections, ignore_index=True)
+                        final_df.to_csv(csv_path, index=False)
+                        exported_files.append(str(csv_path))
+                    
+                    if export_format in ["Excel", "Both"]:
+                        # Export Excel with separate sheets
+                        excel_filename = f"{base_name}_samcell_metrics.xlsx"
+                        excel_path = base_dir / excel_filename
+                        
+                        try:
+                            # Calculate statistics
+                            stats_df = calculate_metric_statistics(metrics_data)
+                            
+                            with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+                                # Per-cell metrics
+                                metrics_data.to_excel(writer, sheet_name='Per_Cell_Metrics', index=False)
+                                
+                                # Metric statistics
+                                if not stats_df.empty:
+                                    stats_df.to_excel(writer, sheet_name='Metric_Statistics', index=False)
+                                
+                                # Add a summary sheet with key statistics
+                                summary_stats = {
+                                    'Metric': ['Total Cells', 'Mean Area', 'Median Area', 'Mean Perimeter', 'Mean Compactness'],
+                                    'Value': [
+                                        len(metrics_data),
+                                        f"{metrics_data['area'].mean():.1f}" if 'area' in metrics_data.columns else 'N/A',
+                                        f"{metrics_data['area'].median():.1f}" if 'area' in metrics_data.columns else 'N/A',
+                                        f"{metrics_data['perimeter'].mean():.1f}" if 'perimeter' in metrics_data.columns else 'N/A',
+                                        f"{metrics_data['compactness'].mean():.3f}" if 'compactness' in metrics_data.columns else 'N/A',
+                                    ]
+                                }
+                                pd.DataFrame(summary_stats).to_excel(writer, sheet_name='Quick_Summary', index=False)
+                            
+                            exported_files.append(str(excel_path))
+                            
+                        except Exception as excel_error:
+                            logger.warning(f"Excel export failed: {excel_error}, falling back to CSV only")
+                            # Fall back to CSV if Excel fails
+                            if export_format == "Excel":
+                                csv_filename = f"{base_name}_samcell_metrics.csv"
+                                csv_path = base_dir / csv_filename
+                                metrics_data.to_csv(csv_path, index=False)
+                                exported_files.append(str(csv_path))
+                    
+                    # Show success message
+                    if exported_files:
+                        files_str = ", ".join([Path(f).name for f in exported_files])
+                        logger.info(f"Metrics exported to: {files_str}")
+                        show_info(f"Metrics exported to: {files_str}")
                     
                 except Exception as e:
                     logger.error(f"Error exporting metrics: {str(e)}")
